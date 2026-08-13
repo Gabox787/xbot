@@ -1,0 +1,19 @@
+# Секреты
+.env
+
+# Локальная база данных
+posts.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# OS
+.DS_Store

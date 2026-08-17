@@ -9,7 +9,9 @@
 5. Публикация в Telegram-канал (sendPhoto)
 6. Сохранение ID твита в базу, чтобы не постить дубликаты
 
-Предназначен для запуска на Render как Background Worker (24/7 цикл).
+Предназначен для запуска на Render как Web Service: поднимает лёгкий HTTP-сервер
+(для health-check запросов от Render/UptimeRobot, чтобы сервис не засыпал), а сам
+пайплайн бота крутится в фоновом потоке.
 """
 
 import os
@@ -18,10 +20,12 @@ import json
 import time
 import sqlite3
 import logging
+import threading
 from datetime import datetime, timezone
 
 import requests
 import schedule
+from flask import Flask
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -45,8 +49,18 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 RSS_SOURCE_URL = os.getenv("RSS_SOURCE_URL", "")  # URL источника твитов (RSS/JSON API)
 DB_PATH = os.getenv("DB_PATH", "posts.db")
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
+PORT = int(os.getenv("PORT", "10000"))  # Render передаёт актуальный порт через PORT
 
 REQUIRED_ENV_VARS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY"]
+
+# Мини веб-сервер только для health-check запросов (Render / UptimeRobot).
+# Никакой бизнес-логики здесь нет — вся работа бота идёт в фоновом потоке.
+app = Flask(__name__)
+
+
+@app.route("/")
+def health_check():
+    return "Bot is alive", 200
 
 SYSTEM_PROMPT = (
     "Ты — профессиональный криптовалютный аналитик, редактор Telegram-канала "
@@ -303,13 +317,8 @@ def process_pipeline() -> None:
 # Точка входа
 # ---------------------------------------------------------------------------
 
-def main() -> None:
-    global client
-
-    validate_env()
-    client = OpenAI(api_key=OPENAI_API_KEY)
-    init_db()
-
+def run_bot_loop() -> None:
+    """Бесконечный цикл пайплайна бота. Выполняется в фоновом потоке."""
     logger.info("Бот запущен. Выполняется первый запуск пайплайна...")
     try:
         process_pipeline()
@@ -329,6 +338,22 @@ def main() -> None:
             # Бот никогда не должен падать целиком — логируем и продолжаем работу
             logger.error("Непредвиденная ошибка в основном цикле: %s", exc)
             time.sleep(10)
+
+
+def main() -> None:
+    global client
+
+    validate_env()
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    init_db()
+
+    # Пайплайн бота работает в отдельном потоке, чтобы не блокировать Flask —
+    # Render считает сервис "живым", пока отвечает HTTP-порт.
+    bot_thread = threading.Thread(target=run_bot_loop, daemon=True)
+    bot_thread.start()
+
+    logger.info("Запускаю HTTP-сервер на порту %s для health-check.", PORT)
+    app.run(host="0.0.0.0", port=PORT)
 
 
 if __name__ == "__main__":

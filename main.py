@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 
 import requests
 import schedule
+import feedparser
 from flask import Flask
 from google import genai
 from google.genai import types
@@ -149,32 +150,37 @@ def mark_as_published(tweet_id: str) -> None:
 
 def fetch_new_posts() -> list[dict]:
     """
-    Получает сырые посты из источника (RSS/JSON API).
+    Получает свежие записи из RSS-ленты (например, крипто-новостного издания).
 
-    Ожидаемый формат каждого элемента: {"id": "уникальный_id", "text": "текст твита"}.
+    Ожидаемый формат каждого элемента после парсинга: {"id": "уникальный_id", "text": "текст записи"}.
 
     Если RSS_SOURCE_URL не задан, функция работает как заглушка и возвращает
-    пустой список — подставь сюда свой парсер (Nitter RSS, сторонний API,
-    Twitter/X API и т.д.).
+    пустой список.
     """
     if not RSS_SOURCE_URL:
         logger.warning(
             "RSS_SOURCE_URL не задан — fetch_new_posts() работает как заглушка "
-            "и не возвращает постов. Подключи свой источник данных."
+            "и не возвращает постов. Укажи ссылку на RSS-ленту в переменных окружения."
         )
         return []
 
     try:
-        response = requests.get(RSS_SOURCE_URL, timeout=15)
-        response.raise_for_status()
-        data = response.json()
+        feed = feedparser.parse(RSS_SOURCE_URL)
+
+        if feed.bozo and not feed.entries:
+            logger.error("Не удалось разобрать RSS-ленту: %s", feed.bozo_exception)
+            return []
 
         posts = []
-        for item in data.get("items", []):
-            tweet_id = item.get("id")
-            text = item.get("text", "")
-            if tweet_id and text:
-                posts.append({"id": str(tweet_id), "text": text})
+        for entry in feed.entries:
+            # id записи: сначала пробуем guid/id, иначе берём ссылку на статью
+            post_id = entry.get("id") or entry.get("link")
+            # текст: краткое описание, если его нет — заголовок
+            text = entry.get("summary") or entry.get("title", "")
+
+            if post_id and text:
+                posts.append({"id": str(post_id), "text": text})
+
         return posts
     except Exception as exc:
         logger.error("Ошибка при получении твитов из источника: %s", exc)

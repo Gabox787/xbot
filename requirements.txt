@@ -1,5 +1,5 @@
 requests>=2.31.0
-openai>=1.30.0
+google-genai>=0.3.0
 schedule>=1.2.0
 python-dotenv>=1.0.0
 flask>=3.0.0

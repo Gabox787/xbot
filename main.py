@@ -4,8 +4,8 @@
 Пайплайн:
 1. Парсинг сырых твитов (fetch_new_posts)
 2. Фильтрация уже опубликованных твитов по локальной SQLite-базе
-3. Генерация текста поста + промпта для картинки через GPT-4o-mini (JSON-ответ)
-4. Генерация картинки через DALL-E 3
+3. Генерация текста поста + промпта для картинки через Gemini 2.5 Flash (JSON-ответ)
+4. Генерация картинки через Gemini 2.5 Flash Image (Nano Banana)
 5. Публикация в Telegram-канал (sendPhoto)
 6. Сохранение ID твита в базу, чтобы не постить дубликаты
 
@@ -26,7 +26,8 @@ from datetime import datetime, timezone
 import requests
 import schedule
 from flask import Flask
-from openai import OpenAI
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 
 # ---------------------------------------------------------------------------
@@ -43,7 +44,7 @@ logger = logging.getLogger("crypto_bot")
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Необязательные параметры со значениями по умолчанию
 RSS_SOURCE_URL = os.getenv("RSS_SOURCE_URL", "")  # URL источника твитов (RSS/JSON API)
@@ -51,7 +52,7 @@ DB_PATH = os.getenv("DB_PATH", "posts.db")
 CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
 PORT = int(os.getenv("PORT", "10000"))  # Render передаёт актуальный порт через PORT
 
-REQUIRED_ENV_VARS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "OPENAI_API_KEY"]
+REQUIRED_ENV_VARS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "GEMINI_API_KEY"]
 
 # Мини веб-сервер только для health-check запросов (Render / UptimeRobot).
 # Никакой бизнес-логики здесь нет — вся работа бота идёт в фоновом потоке.
@@ -76,7 +77,7 @@ SYSTEM_PROMPT = (
     'ВЫВОД: ТОЛЬКО JSON: { "telegram_text": "текст", "image_prompt": "промпт" }'
 )
 
-client: OpenAI | None = None  # инициализируется в main() после проверки ключей
+client: genai.Client | None = None  # инициализируется в main() после проверки ключей
 
 
 # ---------------------------------------------------------------------------
@@ -181,51 +182,52 @@ def fetch_new_posts() -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 2: Генерация текста и промпта для картинки (GPT-4o-mini)
+# Шаг 2: Генерация текста и промпта для картинки (Gemini 2.5 Flash)
 # ---------------------------------------------------------------------------
 
 def generate_content(raw_tweet_text: str) -> dict | None:
-    """Отправляет сырой твит в GPT-4o-mini и получает JSON с текстом и image_prompt."""
+    """Отправляет сырой твит в Gemini 2.5 Flash и получает JSON с текстом и image_prompt."""
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            response_format={"type": "json_object"},
-            temperature=0.7,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": raw_tweet_text},
-            ],
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=raw_tweet_text,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT,
+                response_mime_type="application/json",
+                temperature=0.7,
+            ),
         )
-        raw_content = response.choices[0].message.content
-        data = json.loads(raw_content)
+        data = json.loads(response.text)
 
         if "telegram_text" not in data or "image_prompt" not in data:
-            logger.error("Ответ OpenAI не содержит нужных полей: %s", data)
+            logger.error("Ответ Gemini не содержит нужных полей: %s", data)
             return None
 
         return data
     except Exception as exc:
-        logger.error("Ошибка генерации контента через GPT-4o-mini: %s", exc)
+        logger.error("Ошибка генерации контента через Gemini 2.5 Flash: %s", exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3: Генерация картинки (DALL-E 3)
+# Шаг 3: Генерация картинки (Gemini 2.5 Flash Image / Nano Banana)
 # ---------------------------------------------------------------------------
 
-def generate_image(image_prompt: str) -> str | None:
-    """Генерирует изображение через DALL-E 3 и возвращает его URL."""
+def generate_image(image_prompt: str) -> bytes | None:
+    """Генерирует изображение через Gemini 2.5 Flash Image и возвращает его байты."""
     try:
-        response = client.images.generate(
-            model="dall-e-3",
-            prompt=image_prompt,
-            size="1024x1024",
-            quality="standard",
-            n=1,
+        response = client.models.generate_content(
+            model="gemini-2.5-flash-image",
+            contents=[image_prompt],
         )
-        return response.data[0].url
+        for part in response.candidates[0].content.parts:
+            if part.inline_data is not None:
+                return part.inline_data.data
+
+        logger.error("Gemini не вернул изображение в ответе.")
+        return None
     except Exception as exc:
-        logger.error("Ошибка генерации изображения через DALL-E 3: %s", exc)
+        logger.error("Ошибка генерации изображения через Gemini 2.5 Flash Image: %s", exc)
         return None
 
 
@@ -233,17 +235,17 @@ def generate_image(image_prompt: str) -> str | None:
 # Шаг 4: Публикация в Telegram
 # ---------------------------------------------------------------------------
 
-def publish_to_telegram(image_url: str, caption: str) -> bool:
-    """Публикует картинку с подписью в Telegram-канал через метод sendPhoto."""
+def publish_to_telegram(image_bytes: bytes, caption: str) -> bool:
+    """Публикует картинку (байты) с подписью в Telegram-канал через метод sendPhoto."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-    payload = {
+    data = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "photo": image_url,
         "caption": caption[:1024],  # Telegram ограничивает caption 1024 символами
         "parse_mode": "HTML",
     }
+    files = {"photo": ("image.png", image_bytes, "image/png")}
     try:
-        response = requests.post(url, data=payload, timeout=30)
+        response = requests.post(url, data=data, files=files, timeout=60)
         response.raise_for_status()
         result = response.json()
         if not result.get("ok"):
@@ -290,8 +292,8 @@ def process_pipeline() -> None:
 
         time.sleep(2)  # пауза перед генерацией картинки (rate limit)
 
-        image_url = generate_image(content["image_prompt"])
-        if image_url is None:
+        image_bytes = generate_image(content["image_prompt"])
+        if image_bytes is None:
             logger.warning(
                 "Не удалось сгенерировать картинку для твита %s, пропуск.", tweet_id
             )
@@ -299,7 +301,7 @@ def process_pipeline() -> None:
 
         time.sleep(2)  # пауза перед публикацией (rate limit)
 
-        success = publish_to_telegram(image_url, content["telegram_text"])
+        success = publish_to_telegram(image_bytes, content["telegram_text"])
         if success:
             mark_as_published(tweet_id)
             logger.info("Твит %s успешно опубликован.", tweet_id)
@@ -344,7 +346,7 @@ def main() -> None:
     global client
 
     validate_env()
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    client = genai.Client(api_key=GEMINI_API_KEY)
     init_db()
 
     # Пайплайн бота работает в отдельном потоке, чтобы не блокировать Flask —

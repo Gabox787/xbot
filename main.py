@@ -4,8 +4,8 @@
 Пайплайн:
 1. Парсинг сырых твитов (fetch_new_posts)
 2. Фильтрация уже опубликованных твитов по локальной SQLite-базе
-3. Генерация текста поста + промпта для картинки через Gemini 2.5 Flash (JSON-ответ)
-4. Генерация картинки через Gemini 2.5 Flash Image (Nano Banana)
+3. Генерация текста поста + промпта для картинки через Gemini 3.6 Flash (JSON-ответ)
+4. Генерация картинки через Pollinations.ai (бесплатно, без ключа)
 5. Публикация в Telegram-канал (sendPhoto)
 6. Сохранение ID твита в базу, чтобы не постить дубликаты
 
@@ -21,6 +21,7 @@ import time
 import sqlite3
 import logging
 import threading
+import urllib.parse
 from datetime import datetime, timezone
 
 import requests
@@ -192,10 +193,10 @@ def fetch_new_posts() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def generate_content(raw_tweet_text: str) -> dict | None:
-    """Отправляет сырой твит в Gemini 2.5 Flash и получает JSON с текстом и image_prompt."""
+    """Отправляет сырой твит в Gemini 3.6 Flash и получает JSON с текстом и image_prompt."""
     try:
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.6-flash",
             contents=raw_tweet_text,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
@@ -211,29 +212,33 @@ def generate_content(raw_tweet_text: str) -> dict | None:
 
         return data
     except Exception as exc:
-        logger.error("Ошибка генерации контента через Gemini 2.5 Flash: %s", exc)
+        logger.error("Ошибка генерации контента через Gemini 3.6 Flash: %s", exc)
         return None
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3: Генерация картинки (Gemini 2.5 Flash Image / Nano Banana)
+# Шаг 3: Генерация картинки (Pollinations.ai — бесплатно, без ключа)
 # ---------------------------------------------------------------------------
 
 def generate_image(image_prompt: str) -> bytes | None:
-    """Генерирует изображение через Gemini 2.5 Flash Image и возвращает его байты."""
-    try:
-        response = client.models.generate_content(
-            model="gemini-2.5-flash-image",
-            contents=[image_prompt],
-        )
-        for part in response.candidates[0].content.parts:
-            if part.inline_data is not None:
-                return part.inline_data.data
+    """Генерирует изображение через Pollinations.ai и возвращает его байты.
 
-        logger.error("Gemini не вернул изображение в ответе.")
-        return None
+    Pollinations.ai не требует API-ключа и не имеет платного порога, в отличие
+    от текущих моделей Gemini image (Nano Banana), которые с середины 2026 года
+    стали платными без бесплатного тарифа.
+    """
+    try:
+        encoded_prompt = urllib.parse.quote(image_prompt)
+        url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
+        response = requests.get(
+            url,
+            params={"width": 1024, "height": 1024, "nologo": "true"},
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.content
     except Exception as exc:
-        logger.error("Ошибка генерации изображения через Gemini 2.5 Flash Image: %s", exc)
+        logger.error("Ошибка генерации изображения через Pollinations.ai: %s", exc)
         return None
 
 

@@ -18,6 +18,7 @@ import os
 import sys
 import json
 import time
+import html
 import sqlite3
 import logging
 import threading
@@ -55,6 +56,7 @@ CHECK_INTERVAL_MINUTES = int(os.getenv("CHECK_INTERVAL_MINUTES", "15"))
 PORT = int(os.getenv("PORT", "10000"))  # Render передаёт актуальный порт через PORT
 
 REQUIRED_ENV_VARS = ["TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID", "GEMINI_API_KEY"]
+TELEGRAM_CAPTION_LIMIT = 1024  # ограничение Telegram на длину caption у sendPhoto
 
 # Мини веб-сервер только для health-check запросов (Render / UptimeRobot).
 # Никакой бизнес-логики здесь нет — вся работа бота идёт в фоновом потоке.
@@ -153,7 +155,7 @@ def fetch_new_posts() -> list[dict]:
     """
     Получает свежие записи из RSS-ленты (например, крипто-новостного издания).
 
-    Ожидаемый формат каждого элемента после парсинга: {"id": "уникальный_id", "text": "текст записи"}.
+    Ожидаемый формат каждого элемента после парсинга: {"id": ..., "text": ..., "link": "ссылка на статью"}.
 
     Если RSS_SOURCE_URL не задан, функция работает как заглушка и возвращает
     пустой список.
@@ -174,13 +176,14 @@ def fetch_new_posts() -> list[dict]:
 
         posts = []
         for entry in feed.entries:
+            link = entry.get("link", "")
             # id записи: сначала пробуем guid/id, иначе берём ссылку на статью
-            post_id = entry.get("id") or entry.get("link")
+            post_id = entry.get("id") or link
             # текст: краткое описание, если его нет — заголовок
             text = entry.get("summary") or entry.get("title", "")
 
             if post_id and text:
-                posts.append({"id": str(post_id), "text": text})
+                posts.append({"id": str(post_id), "text": text, "link": link})
 
         return posts
     except Exception as exc:
@@ -251,7 +254,7 @@ def publish_to_telegram(image_bytes: bytes, caption: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
     data = {
         "chat_id": TELEGRAM_CHAT_ID,
-        "caption": caption[:1024],  # Telegram ограничивает caption 1024 символами
+        "caption": caption,
         "parse_mode": "HTML",
     }
     files = {"photo": ("image.png", image_bytes, "image/png")}
@@ -266,6 +269,24 @@ def publish_to_telegram(image_bytes: bytes, caption: str) -> bool:
     except Exception as exc:
         logger.error("Ошибка при публикации в Telegram: %s", exc)
         return False
+
+
+# ---------------------------------------------------------------------------
+# Вспомогательное: красивое имя источника по ссылке
+# ---------------------------------------------------------------------------
+
+def get_source_name(url: str) -> str:
+    """Извлекает и форматирует название источника из домена ссылки.
+
+    Например: https://cointelegraph.com/news/... -> "Cointelegraph".
+    """
+    try:
+        netloc = urllib.parse.urlparse(url).netloc
+        netloc = netloc.replace("www.", "")
+        name = netloc.split(".")[0]
+        return name.capitalize() if name else "Источник"
+    except Exception:
+        return "Источник"
 
 
 # ---------------------------------------------------------------------------
@@ -312,7 +333,23 @@ def process_pipeline() -> None:
 
         time.sleep(2)  # пауза перед публикацией (rate limit)
 
-        success = publish_to_telegram(image_bytes, content["telegram_text"])
+        source_link = post.get("link", "")
+        main_text = content["telegram_text"]
+        footer = ""
+        if source_link:
+            source_name = get_source_name(source_link)
+            safe_link = html.escape(source_link, quote=True)
+            footer = f'\n\n🔗 Источник: <a href="{safe_link}">{source_name}</a>'
+
+        # Обрезаем именно основной текст, а не готовую строку с футером —
+        # иначе можно случайно разорвать HTML-тег ссылки при обрезке по лимиту.
+        max_text_length = TELEGRAM_CAPTION_LIMIT - len(footer)
+        if len(main_text) > max_text_length:
+            main_text = main_text[: max_text_length - 1].rstrip() + "…"
+
+        caption = main_text + footer
+
+        success = publish_to_telegram(image_bytes, caption)
         if success:
             mark_as_published(tweet_id)
             logger.info("Твит %s успешно опубликован.", tweet_id)

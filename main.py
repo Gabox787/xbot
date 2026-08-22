@@ -15,6 +15,7 @@
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -70,7 +71,7 @@ def health_check():
 SYSTEM_PROMPT = (
     "Ты — профессиональный криптовалютный аналитик, редактор Telegram-канала "
     "и ИИ-художник. Твоя задача: проанализировать сырой твит о криптовалюте и "
-    "создать из него два элемента.\n"
+    "создать из него три элемента.\n"
     "ПРАВИЛА ДЛЯ ТЕКСТА: Извлекай только факты. Тон: объективный. Язык: "
     "Русский (с крипто-сленгом). Структура строго: [Эмодзи] [ЗАГОЛОВОК КАПСОМ] "
     "\n\n 🔹 Суть: [1-2 предложения] \n 💡 Импакт: [1 предложение о влиянии на "
@@ -89,7 +90,12 @@ SYSTEM_PROMPT = (
     "профессиональная атмосферная иллюстрация без текста и надписей на "
     "картинке, без узнаваемых лиц реальных людей (никаких портретов "
     "конкретных персон — только абстрактные символы, объекты или силуэты).\n"
-    'ВЫВОД: ТОЛЬКО JSON: { "telegram_text": "текст", "image_prompt": "промпт" }'
+    "ПРАВИЛА ДЛЯ ХЭШТЕГОВ: Определи 2-4 ключевых объекта новости — монеты, "
+    "компании, персоны, темы (например: если новость про покупку BlackRock "
+    "биткоина — теги 'Биток' и 'БлэкРок'). Каждый тег: одно слово без "
+    "пробелов и без символа #, в стиле крипто-сленга, с заглавной буквы.\n"
+    'ВЫВОД: ТОЛЬКО JSON: { "telegram_text": "текст", "image_prompt": "промпт", '
+    '"hashtags": ["тег1", "тег2"] }'
 )
 
 client: genai.Client | None = None  # инициализируется в main() после проверки ключей
@@ -224,6 +230,10 @@ def generate_content(raw_tweet_text: str) -> dict | None:
             logger.error("Ответ Gemini не содержит нужных полей: %s", data)
             return None
 
+        # hashtags — необязательное поле: если модель его не вернула,
+        # публикация всё равно продолжится, просто без тегов
+        data.setdefault("hashtags", [])
+
         return data
     except Exception as exc:
         logger.error("Ошибка генерации контента через Gemini 3.6 Flash: %s", exc)
@@ -306,6 +316,19 @@ def get_source_name(url: str) -> str:
         return "Источник"
 
 
+def format_hashtags(tags: list) -> str:
+    """Превращает список сырых тегов от Gemini в строку вида '#Биток #БлэкРок'.
+
+    Убирает пробелы и любые символы, которые сломали бы хэштег в Telegram.
+    """
+    clean_tags = []
+    for tag in tags:
+        clean = re.sub(r"[^\w]", "", str(tag), flags=re.UNICODE)
+        if clean:
+            clean_tags.append(f"#{clean}")
+    return " ".join(clean_tags)
+
+
 # ---------------------------------------------------------------------------
 # Основной пайплайн
 # ---------------------------------------------------------------------------
@@ -350,13 +373,19 @@ def process_pipeline() -> None:
 
         time.sleep(2)  # пауза перед публикацией (rate limit)
 
+        hashtags_line = format_hashtags(content.get("hashtags", []))
         source_link = post.get("link", "")
         main_text = content["telegram_text"]
-        footer = ""
+
+        footer_parts = []
+        if hashtags_line:
+            footer_parts.append(hashtags_line)
         if source_link:
             source_name = get_source_name(source_link)
             safe_link = html.escape(source_link, quote=True)
-            footer = f'\n\n🔗 Источник: <a href="{safe_link}">{source_name}</a>'
+            footer_parts.append(f'🔗 Источник: <a href="{safe_link}">{source_name}</a>')
+
+        footer = ("\n\n" + "\n".join(footer_parts)) if footer_parts else ""
 
         # Обрезаем именно основной текст, а не готовую строку с футером —
         # иначе можно случайно разорвать HTML-тег ссылки при обрезке по лимиту.

@@ -235,7 +235,13 @@ def generate_image(image_prompt: str) -> bytes | None:
         url = f"https://image.pollinations.ai/prompt/{encoded_prompt}"
         response = requests.get(
             url,
-            params={"width": 1024, "height": 1024, "nologo": "true"},
+            params={
+                "width": 1024,
+                "height": 1024,
+                "model": "flux",  # заметно чётче и качественнее модели по умолчанию
+                "enhance": "true",  # автоматическое улучшение промпта
+                "nologo": "true",
+            },
             timeout=60,
         )
         response.raise_for_status()
